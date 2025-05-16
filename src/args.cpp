@@ -1,5 +1,7 @@
 #include "args.h"
 
+#error test
+
 std::string arg::help_text() {
     std::string htxt = full_name;
     if (abbreviation != "") {
