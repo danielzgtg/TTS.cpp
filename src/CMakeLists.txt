@@ -1,39 +1,25 @@
-# TODO: should not use this
-if (WIN32)
-    if (BUILD_SHARED_LIBS)
-        set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-    endif()
-endif()
+add_library(tokenizer
+        ../include/args_config.h
+        ../include/imports.h
+        ../include/tokenizer.h
+        tokenizer.cpp
+        util.h # TODO move to tts-base once string operations are replaced by C++20
+        util.cpp
+)
+target_include_directories(tokenizer PUBLIC ../include)
+target_include_directories(tokenizer PUBLIC ../ggml/src) # TODO rm once string operations are replaced by C++20
+target_link_libraries(tokenizer PUBLIC ggml)
 
-# TTS
+add_library(tts-base
+        ../include/common.h
+        buffers.cpp
+        buffers.h
+        sampler.cpp
+        sampler.h
+        tts_model.cpp
+)
+add_subdirectory(decoder)
+target_include_directories(tts-base PUBLIC . ../ggml/src ./models)
+target_link_libraries(tts-base PUBLIC tokenizer)
 
-add_library(tts
-            ../include/tts.h
-            ../include/phonemizer.h
-            tts.cpp
-            tokenizer.cpp
-            sampler.cpp
-            parler_model.cpp
-            dac_model.cpp
-            util.cpp
-            t5_encoder_model.cpp
-            phonemizer.cpp
-            tts_model.cpp
-            kokoro_model.cpp
-            dia_model.cpp
-            )
-
-target_include_directories(tts PUBLIC . ../include ../ggml/src/)
-
-if (ESPEAK_INCLUDE_DIRS)
-    set_source_files_properties(phonemizer.cpp PROPERTIES COMPILE_FLAGS "${ESPEAK_CFLAGS_OTHER}")
-    set_source_files_properties(phonemizer.cpp PROPERTIES INCLUDE_DIRECTORIES "${ESPEAK_INCLUDE_DIRS}")
-    target_link_libraries(tts PUBLIC ${ESPEAK_LIBRARIES})
-endif()
-target_link_libraries(tts PUBLIC ggml)
-
-if (BUILD_SHARED_LIBS)
-    set_target_properties(tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(tts PRIVATE LLAMA_BUILD)
-    target_compile_definitions(tts PUBLIC  LLAMA_SHARED)
-endif()
+add_subdirectory(models)

@@ -1,16 +1,14 @@
 #include <cstdio>
 
-#include "args_common.h"
+#include "args.h"
 #include "phonemizer.h"
 
 int main(int argc, const char ** argv) {
     arg_list args{};
     args.add({"", "prompt", "p", "The text prompt to phonemize", true});
-    args.add({
-        "", "phonemizer-path", "mp",
-        "The local path of the gguf phonemiser file for TTS.cpp phonemizer. "
-        "Omit this to use eSpeak to generate phonemes"
-    });
+    args.add({ "", "phonemizer-path", "mp",
+               "The local path of the gguf phonemiser file for TTS.cpp phonemizer. "
+               "Omit this to use eSpeak to generate phonemes" });
     add_espeak_voice_arg(args);
     args.parse(argc, argv);
     const str phonemizer_path{args["phonemizer-path"]};

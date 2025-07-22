@@ -1,183 +1,97 @@
-#include <thread>
 #include "quantize_impl.h"
 
+#if defined(__unix__) || defined(__APPLE__)
+#    include <fcntl.h>
+#endif
+
+#include <cstring>
+#include <filesystem>
 #include <fstream>
-#include <mutex>
+#include <thread>
 
-#include "util.h"
+#include "ggml-cpp.h"
+#include "ggml-iterator.h"
+#include "llama-mmap.h"
 
-namespace {
-bool kokoro_is_f16_compatible(std::string name) {
-    return name.find("voice_tensors") == std::string::npos &&
-           name.find("bias") == std::string::npos &&
-           name.find("gamma") == std::string::npos &&
-           name.find("beta") == std::string::npos &&
-           name.find("alpha") == std::string::npos &&
-           !has_suffix(name, "embd") &&
-           !has_suffix(name, "norm");
-}
+// Reuse some fields that are only used during inferencing
+#define out_tensor_nb view_offs
+#define out_job_index padding
+#define out_data      extra
 
-bool kokoro_is_quantizable(str name) {
-    // A list of all of the top level GGUF names under kokoro.duration_predictor that have quantization compatible tensors.
-    constexpr std::array<const char *, 5> DURATION_PREDICTOR_QUANTIZATION_COMPATIBLE_PARTS = {
-        "duration_proj",
-        "encode",
-        "shared_lstm",
-        "duration_lstm",
-        "layers"
-    };
-    if (kokoro_is_f16_compatible(name)) {
-        if (has_prefix(name, "kokoro.albert") || has_prefix(name, "kokoro.text_encoder.lstm")) {
-            return true;
-        } else if (has_prefix(name, "kokoro.duration_predictor.")) {
-            std::vector<std::string> parts = split(name, ".");
-            for (std::string part : DURATION_PREDICTOR_QUANTIZATION_COMPATIBLE_PARTS) {
-                if (part == parts[2]) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-bool dia_is_quantizable(str name, const quantization_params & params) {
-    // The DAC audio encoder / decoder is not compatible with quantization and normalization tensors should not be quantized.
-    bool quantizable = !has_prefix(name, "audio_encoder") && !has_suffix(name, "norm");
-    if (!params.quantize_output_heads) {
-        quantizable = quantizable && !has_prefix(name, "dia.decoder.heads");
-    }
-    return quantizable;
-}
-
-bool parler_is_quanitizable(str name, const quantization_params & params) {
-    // the DAC audio encoder / decoder is not compatible with quantization, normalization weight shouldn't be quantized, and the text encoding shouldn't be normalized.
-    bool quantizable = !has_prefix(name, "audio_encoder") && !has_suffix(name, "norm.weight") && !has_suffix(name, "text_encoding") && !has_suffix(name, "positional_embed") && !has_suffix(name, "norm.bias");
-    if (!params.quantize_output_heads) {
-        quantizable = quantizable && !has_suffix(name, "weight.head");
-    }
-    if (!params.quantize_text_embeddings) {
-        quantizable = quantizable && !has_suffix(name, "embed_prompts");
-    }
-    if (!params.quantize_cross_attn_kv) {
-        quantizable = quantizable && !has_suffix(name, "encoder_attn.k_proj.weight") && !has_suffix(name, "encoder_attn.v_proj.weight");
-    }
-    return quantizable;
-}
-
-bool is_quantizable(tts_arch arch, str name, const quantization_params & params) {
-    switch(arch) {
-        case PARLER_TTS_ARCH:
-            return parler_is_quanitizable(name, params);
-        case DIA_ARCH:
-            return dia_is_quantizable(name, params);
-        case KOKORO_ARCH:
-            return kokoro_is_quantizable(name);
-        default:
-            TTS_ABORT("%s failed. The architecture '%d' is not supported.", __func__, arch);
-    }
-}
-
-size_t quantize_tensor(void * new_data, struct ggml_tensor * tensor, const float * imatrix, enum ggml_type qtype, uint32_t n_threads) {
-    // much of this is form copied from llama.cpp
-    int chunk_size_multiplier = 1;
+template <bool plan_only> static void quantize_tensor(ggml_type qtype, ggml_tensor * tensor, bool single_thread) {
+    int chunk_size_multiplier{ 1 };
     if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8 || qtype == GGML_TYPE_Q4_0_8_8) {
-        if ((qtype == GGML_TYPE_Q4_0_8_8) && (tensor->ne[1] % 8 != 0)) qtype = GGML_TYPE_Q4_0;
-        else if (tensor->ne[1] % 4 != 0) qtype = GGML_TYPE_Q4_0;
-        if (qtype == GGML_TYPE_Q4_0_8_8) chunk_size_multiplier = 8;
-        else if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8) chunk_size_multiplier = 4;
-    }
-    size_t out_size = 0;
-    const int32_t d3_step = tensor->ne[0] * tensor->ne[1];
-    const int32_t n_per_row = tensor->ne[0];
-    const int32_t nrows = tensor->ne[1];
-    static const int32_t min_chunk_size = 32 * 512;
-    const int32_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row)) * chunk_size_multiplier;
-    uint32_t thread_count = std::max(1, std::min((int)n_threads, (int)(d3_step + chunk_size - 1) / chunk_size));
-    std::mutex mutex;
-
-    for (int32_t d3_index = 0; d3_index < tensor->ne[2]; d3_index++) {
-        const float * f32_data_d3 = ((float *) tensor->data) + d3_index * d3_step;
-        void * new_data_d3 = (char *)new_data + ggml_row_size(qtype, tensor->ne[0]) * d3_index * nrows;
-        const float * imatrix_03 = imatrix ? imatrix + d3_index * tensor->ne[0] : nullptr;
-        if (thread_count <= 1) {
-            // not threaded
-            out_size += ggml_quantize_chunk(qtype, f32_data_d3, new_data_d3, 0, nrows, n_per_row, imatrix);
-        } else {
-            std::vector <std::thread> threads;
-            int64_t counter = 0;
-            size_t new_size = 0;
-            bool valid = true;
-            for (uint32_t t = 0; t < thread_count; t++) {
-                auto func = [&mutex, &counter, &new_size, &valid, qtype, f32_data_d3, new_data_d3, chunk_size, nrows, n_per_row, imatrix]() {
-                    const int64_t nrows_per_chunk = chunk_size / n_per_row;
-                    size_t local_size = 0;
-                    while (true) {
-                        std::unique_lock<std::mutex> lock(mutex);
-                        int64_t first_row = counter;
-                        counter += nrows_per_chunk;
-                        if (first_row >= nrows) {
-                            if (local_size > 0) {
-                                new_size += local_size;
-                            }
-                            break;
-                        }
-                        lock.unlock();
-                        const int64_t this_nrow = std::min(nrows - first_row, nrows_per_chunk);
-                        size_t this_size = ggml_quantize_chunk(qtype, f32_data_d3, new_data_d3, first_row * n_per_row, this_nrow, n_per_row, imatrix);
-                        local_size += this_size;
-
-                        // validate the quantized data; I am not sure how this would occur, but there is always the safe fallback on doing this single threaded.
-                        const size_t row_size  = ggml_row_size(qtype, n_per_row);
-                        void * this_data = (char *) new_data_d3 + first_row * row_size;
-                        if (!ggml_validate_row_data(qtype, this_data, this_size)) {
-                            std::unique_lock<std::mutex> lock(mutex);
-                            valid = false;
-                            break;
-                        }
-                    }
-                };
-                threads.push_back(std::thread(func));
-            }
-            for (auto & t : threads) t.join();
-
-            if (!valid) {
-                TTS_ABORT("Validation of quantized data failed. Please try again and/or switch to single thread quantization.\n");
-            }
-            out_size += new_size;
+        if (qtype == GGML_TYPE_Q4_0_8_8 && tensor->ne[1] % 8 != 0 || tensor->ne[1] % 4 != 0) {
+            qtype = GGML_TYPE_Q4_0;
+        }
+        if (qtype == GGML_TYPE_Q4_0_8_8) {
+            chunk_size_multiplier = 8;
+        } else if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8) {
+            chunk_size_multiplier = 4;
         }
     }
-    return out_size;
-}
+    const int64_t d3_step{ tensor->ne[0] * tensor->ne[1] };
+    const int64_t n_per_row{ tensor->ne[0] };
+    const int64_t nrows{ tensor->ne[1] };
+    const size_t  row_size{ ggml_row_size(qtype, n_per_row) };
 
-void zeros(std::ofstream & file, size_t n) {
-    char zero = 0;
-    for (size_t i = 0; i < n; ++i) {
-        file.write(&zero, 1);
+    static constexpr int64_t min_chunk_size{ 32 * 512 };
+    const int64_t            chunk_size{ chunk_size_multiplier * n_per_row *
+                              (n_per_row >= min_chunk_size ? 1 : (min_chunk_size + n_per_row - 1) / n_per_row) };
+    const int64_t            nrows_per_chunk{ single_thread ? nrows : chunk_size / n_per_row };
+
+    if constexpr (plan_only) {
+        tensor->out_tensor_nb = 0;
+    }
+    const int64_t nchunks_per_d3{ (nrows + nrows_per_chunk - 1) / nrows_per_chunk };
+    const int64_t njobs{ nchunks_per_d3 * tensor->ne[2] };
+    TTS_ASSERT(njobs);
+    atomic<int64_t> & job_index_{ reinterpret_cast<atomic<int64_t> &>(tensor->out_job_index) };
+    int64_t           job_index;
+    while ((job_index = job_index_.fetch_add(1, memory_order_relaxed)) < njobs) {
+        const int64_t       d3_index{ job_index / nchunks_per_d3 };
+        const float * const f32_data_d3 = static_cast<float *>(tensor->data) + d3_index * d3_step;
+        char * const        new_data_d3 = static_cast<char *>(tensor->out_data) + d3_index * row_size * nrows;
+
+        const int64_t i1{ job_index % nchunks_per_d3 * nrows_per_chunk };
+        const int64_t this_nrow = min(nrows - i1, nrows_per_chunk);
+        const size_t  plan_size{ this_nrow * row_size };
+        if constexpr (plan_only) {
+            tensor->out_tensor_nb += plan_size;
+            continue;
+        }
+
+        const size_t this_size{ ggml_quantize_chunk(qtype, f32_data_d3, new_data_d3, i1 * n_per_row, this_nrow,
+                                                    n_per_row, nullptr) };
+        TTS_ASSERT(plan_size == this_size);
+
+        if (!single_thread) {
+            // validate the quantized data; I am not sure how this would occur,
+            // but there is always the safe fallback on doing this single threaded.
+            TTS_ASSERT(ggml_validate_row_data(qtype, new_data_d3 + i1 * row_size, plan_size));
+        }
+    }
+    if constexpr (plan_only) {
+        tensor->out_tensor_nb = GGML_PAD(tensor->out_tensor_nb, GGUF_DEFAULT_ALIGNMENT);
     }
 }
 
-template <typename T>
-struct no_init {
-    T value;
-    no_init() { /* do nothing */ }
-};
+static void quantization_worker(const ggml_context * weight_ctx, const tts_model_quantizer & quantizer,
+                                const quantization_params & params, bool single_thread) {
+    for (ggml_tensor & cur : ggml_tensor_iterator{ *weight_ctx }) {
+        if (!*cur.name) {
+            continue;
+        }
+        atomic<int64_t> & job_index_{ reinterpret_cast<atomic<int64_t> &>(cur.out_job_index) };
+        if (const ggml_type wanted_type{ quantizer.get_quantize_type(cur.name, params) }) {
+            quantize_tensor<false>(wanted_type, &cur, single_thread);
+        } else if (!job_index_.fetch_add(1, memory_order_relaxed)) {
+            memcpy(cur.out_data, cur.data, cur.out_tensor_nb);
+        }
+    }
 }
 
 void quantize_gguf(str ifile, str ofile, const quantization_params & params) {
-    ggml_context * weight_ctx = NULL;
-    struct gguf_init_params gguf_params = {
-        /*.no_alloc   =*/ false,
-        /*.ctx        =*/ &weight_ctx,
-    };
-    gguf_context * meta_ctx = gguf_init_from_file(ifile, gguf_params);
-    str arch = "parler-tts"; // only parler-tts gguf files should lack an explicit architecture.
-
-    if (int arch_key = gguf_find_key(meta_ctx, "general.architecture"); arch_key != -1) {
-        arch = gguf_get_val_str(meta_ctx, arch_key);
-    }
-    const tts_arch arch_type{parse_arch_type(ifile, arch)};
-
     switch (params.quantize_type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q8_0:
@@ -185,91 +99,126 @@ void quantize_gguf(str ifile, str ofile, const quantization_params & params) {
         case GGML_TYPE_Q4_0:
             break;
         default:
-            fprintf(stdout, "Warning, %s is untested for quantization type '%d'. Use at your own risk.\n", arch, params.quantize_type);
+            fprintf(stdout, "Warning: Untested quantization type '%d'. Use at your own risk.\n", params.quantize_type);
     }
 
-    gguf_context_ptr ctx_out { gguf_init_empty() };
+    llama_file in_mmap_file{ ifile, "rb" };
+    // create/truncate/zero file and assume nobody else will touch it
+    thread     fallocate_thread{ [ofile, fallocate_size = in_mmap_file.size()] {
+#if defined(__unix__) || defined(__APPLE__)
+        const int fd = creat(ofile, 0666);
+        static_cast<void>(!ftruncate(fd, fallocate_size));
+        posix_fallocate(fd, 0, fallocate_size);
+        close(fd);
+#else
+        static_cast<void>(ofstream{ ofile });
+        filesystem::resize_file(ofile, fallocate_size);
+#endif
+    } };
 
+    unique_ptr<llama_mmap> in_mmap{};
+    void *                 in_buffer{};
+    if (llama_mmap::SUPPORTED) {
+        in_mmap   = make_unique<llama_mmap>(&in_mmap_file);
+        in_buffer = in_mmap->addr();
+    }
+    ggml_context *         weight_ctx{};
+    const gguf_context_ptr in_gguf{ gguf_init_from_file(ifile, {
+                                                                   .no_alloc{ llama_mmap::SUPPORTED },
+                                                                   .ctx{ &weight_ctx },
+                                                               }) };
+    TTS_ASSERT(in_gguf);
+    TTS_ASSERT(gguf_find_key(&*in_gguf, "general.alignment") == -1);
+    const tts_model_quantizer & quantizer{ quantizer_from_gguf(&*in_gguf) };
+    if (llama_mmap::SUPPORTED) {
+        in_buffer = static_cast<char *>(in_buffer) + gguf_get_data_offset(&*in_gguf);
+        const int n{ gguf_get_n_tensors(&*in_gguf) };
+        int       i{};
+        for (ggml_tensor & cur : ggml_tensor_iterator{ *weight_ctx }) {
+            TTS_ASSERT(i < n);
+            TTS_ASSERT(!strcmp(cur.name, gguf_get_tensor_name(&*in_gguf, i)));
+            cur.data = static_cast</*const*/ char *>(in_buffer) + gguf_get_tensor_offset(&*in_gguf, i);
+            ++i;
+        }
+    }
+
+    const gguf_context_ptr out_gguf{ gguf_init_empty() };
     // copy the KV pairs from the input file
-    gguf_set_kv(ctx_out.get(), meta_ctx);
-    gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION);
-    gguf_set_val_u32(ctx_out.get(), "general.quantization_type", params.quantize_type);
-    for (ggml_tensor * tensor = ggml_get_first_tensor(weight_ctx); tensor; tensor = ggml_get_next_tensor(weight_ctx, tensor)) {
-        if (*ggml_get_name(tensor)) {
-            gguf_add_tensor(ctx_out.get(), tensor);
-        }
-    }
+    gguf_set_kv(out_gguf.get(), &*in_gguf);
+    gguf_set_val_u32(out_gguf.get(), "general.quantization_version", GGML_QNT_VERSION);
+    gguf_set_val_u32(out_gguf.get(), "general.quantization_type", params.quantize_type);
 
-    std::vector<no_init<uint8_t>> work;
-
-    std::ofstream fout;
-    auto close_ofstream = [&]() {
-        // Write metadata and close file handler
-        if (fout.is_open()) {
-            fout.seekp(0);
-            std::vector<uint8_t> data(gguf_get_meta_size(ctx_out.get()));
-            gguf_get_meta_data(ctx_out.get(), data.data());
-            fout.write((const char *) data.data(), data.size());
-            fout.close();
-        }
-    };
-    auto new_ofstream = [&]() {
-        std::string fname = ofile;
-        fout = std::ofstream(fname, std::ios::binary);
-        fout.exceptions(std::ofstream::failbit); // fail fast on write errors
-        const size_t meta_size = gguf_get_meta_size(ctx_out.get());
-        // placeholder for the meta data
-        ::zeros(fout, meta_size);
-    };
-    new_ofstream();
-    for (ggml_tensor * cur = ggml_get_first_tensor(weight_ctx); cur; cur = ggml_get_next_tensor(weight_ctx, cur)) {
-        const size_t align = GGUF_DEFAULT_ALIGNMENT;
-        ggml_type new_type;
-        void * new_data;
-        size_t new_size;
-        str name = ggml_get_name(cur);
-
-        if (!*name) {
+    const bool single_thread{ params.n_threads <= 1 };
+    size_t     out_tensors_nb{};
+    // Pass 1/3: Calculate sizes
+    for (ggml_tensor & cur : ggml_tensor_iterator{ *weight_ctx }) {
+        if (!*cur.name) {
             continue;
         }
-
-        if (is_quantizable(arch_type, name, params)) {
-            if ((cur->type) != GGML_TYPE_F32) {
-                TTS_ABORT("ERROR: All quantized tensors must be transformed from 32bit floats. Tensor, '%s', has improper type, '%d'\n", cur->name, cur->type);
+        gguf_add_tensor(&*out_gguf, &cur);
+        if (const ggml_type wanted_type{ quantizer.get_quantize_type(cur.name, params) }) {
+            if (cur.type != GGML_TYPE_F32) {
+                TTS_ABORT("Quantization must be from F32. Tensor '%s' has improper type '%d'\n", cur.name, cur.type);
             }
-            new_type = params.quantize_type;
-            if ((new_type >= GGML_TYPE_IQ2_XXS && new_type <= GGML_TYPE_IQ4_XS)) {
-                TTS_ABORT("ERROR: Quantization type '%d' requires an importance matrix.\n", new_type);
+            if (wanted_type >= GGML_TYPE_IQ2_XXS && wanted_type <= GGML_TYPE_IQ4_XS) {
+                TTS_ABORT("Quantization type '%d' requires an importance matrix.\n", wanted_type);
             }
-            const int64_t nelement_size = ggml_nelements(cur) * 4;
-            if (work.size() < (size_t)nelement_size) {
-                work.resize(nelement_size); // upper bound on size
-            }
-            new_data = work.data();
-            new_size = quantize_tensor(new_data, cur, nullptr, new_type, params.n_threads);
-        } else if ((params.convert_non_quantizable_to_f16 && kokoro_is_f16_compatible(name)) || (params.convert_dac_to_f16 && has_prefix(name, "audio_encoder") && !has_suffix(name, "alpha"))) {
-            if ((cur->type) != GGML_TYPE_F32) {
-                TTS_ABORT("ERROR: All converted tensors must be transformed from 32bit floats. Tensor, '%s', has improper type, '%d'\n", cur->name, cur->type);
-            }
-            new_type = GGML_TYPE_F16;
-            const int64_t nelement_size = ggml_nelements(cur) * 4;
-            if (work.size() < (size_t)nelement_size) {
-                work.resize(nelement_size); // upper bound on size
-            }
-            new_data = work.data();
-            new_size = quantize_tensor(new_data, cur, nullptr, new_type, params.n_threads);
+            quantize_tensor<true>(wanted_type, &cur, single_thread);
+            gguf_set_tensor_type(out_gguf.get(), cur.name, wanted_type);
+            gguf_set_tensor_data(out_gguf.get(), cur.name, nullptr, cur.out_tensor_nb);
         } else {
-            new_type = cur->type;
-            new_data = cur->data;
-            new_size = ggml_nbytes(cur);
+            cur.out_tensor_nb = ggml_nbytes(&cur);
         }
-
-        gguf_set_tensor_type(ctx_out.get(), name, new_type);
-        gguf_set_tensor_data(ctx_out.get(), name, new_data, new_size);
-        fprintf(stdout, "At tensor: '%s' with new size: %zu bytes\n", name, new_size);
-        // write tensor data + padding
-        fout.write((const char *) new_data, new_size);
-        zeros(fout, GGML_PAD(new_size, align) - new_size);
+        out_tensors_nb = GGML_PAD(out_tensors_nb + cur.out_tensor_nb, GGUF_DEFAULT_ALIGNMENT);
+        fprintf(stdout, "Planning tensor: '%s' with new size: %zu bytes\n", cur.name, cur.out_tensor_nb);
     }
-    close_ofstream();
+    const size_t out_meta_nb{ gguf_get_meta_size(out_gguf.get()) };
+    const size_t out_nb{ out_meta_nb + out_tensors_nb };
+
+    TTS_ASSERT(out_nb < in_mmap_file.size());
+    if (fallocate_thread.joinable()) {
+        fallocate_thread.join();
+    }
+    filesystem::resize_file(ofile, out_nb);
+    llama_file             out_mmap_file{ ofile, "rb+" };
+    unique_ptr<llama_mmap> out_mmap{};
+    char *                 out_buffer{};
+    if (llama_mmap::SUPPORTED) {
+        out_mmap   = make_unique<llama_mmap>(&out_mmap_file, -1, false, true);
+        out_buffer = static_cast<char *>(out_mmap->addr());
+    } else {
+        out_buffer = new char[out_nb]{};
+    }
+
+    gguf_get_meta_data(out_gguf.get(), out_buffer);
+    out_tensors_nb = out_meta_nb;
+    TTS_ASSERT(out_tensors_nb == GGML_PAD(out_tensors_nb, GGUF_DEFAULT_ALIGNMENT));
+    // Pass 2/3 Initialize output pointers
+    for (ggml_tensor & cur : ggml_tensor_iterator{ *weight_ctx }) {
+        if (!*cur.name) {
+            continue;
+        }
+        new (cur.out_job_index) atomic_int64_t{};
+        cur.out_data   = out_buffer + out_tensors_nb;
+        out_tensors_nb = GGML_PAD(out_tensors_nb + cur.out_tensor_nb, GGUF_DEFAULT_ALIGNMENT);
+    }
+    // Pass 3/3 Quantize in parallel
+    if (params.n_threads > 1) {
+        vector<thread> threads{};
+        threads.reserve(params.n_threads);
+        for (int i = 1; i < params.n_threads; i++) {
+            threads.emplace_back(&quantization_worker, weight_ctx, cref(quantizer), cref(params), single_thread);
+        }
+        quantization_worker(weight_ctx, quantizer, params, single_thread);
+        for (auto & t : threads) {
+            t.join();
+        }
+    } else {
+        quantization_worker(weight_ctx, quantizer, params, single_thread);
+    }
+
+    if (!out_mmap) {
+        out_mmap_file.write_raw(out_buffer, out_nb);
+        delete[] out_buffer;
+    }
 }

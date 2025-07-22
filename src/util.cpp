@@ -12,16 +12,6 @@
 // windows stuff
 #endif
 
-void tts_abort(const char * file, int line, const char * fmt, ...) {
-    fflush(stdout);
-    fprintf(stderr, "%s:%d: ", file, line);
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
-    abort();
-}
-
 // Simple helper function for getting layer count from tensor name
 std::pair<int, std::string> parse_layer_count(std::string name, int skip) {
     bool found = false;
@@ -103,7 +93,7 @@ bool has_prefix(std::string value, std::string prefix) {
 
 struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
     if (window->ne[0] != n_fft) {
-        TTS_ABORT("For #stft the window_size, %d, must be either equal to n_fft, %d, or, when one sided, n_fft / 2 + 1, %d.\n", a->ne[0], n_fft, n_fft/2+1);
+        TTS_ABORT("For #stft the window_size, %ld, must be either equal to n_fft, %ld, or, when one sided, n_fft / 2 + 1, %ld.\n", a->ne[0], n_fft, n_fft/2+1);
     }
     struct ggml_tensor * cur = ggml_stft(ctx, a, window, n_fft, hop, abs_and_angle);
     if (one_sided) {
@@ -115,7 +105,7 @@ struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggm
 
 struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window_squared_sum, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
     if ((!one_sided && a->ne[0] != n_fft) || (one_sided && a->ne[0] != n_fft / 2 + 1)) {
-        TTS_ABORT("For #istft the window_size, %d, must be either equal to n_fft, %d, or, when one sided, n_fft / 2 + 1, %d.\n", a->ne[0], n_fft, n_fft/2+1);
+        TTS_ABORT("For #istft the window_size, %ld, must be either equal to n_fft, %ld, or, when one sided, n_fft / 2 + 1, %ld.\n", a->ne[0], n_fft, n_fft/2+1);
     }
     struct ggml_tensor * cur = ggml_istft(ctx, a, window, n_fft, hop, abs_and_angle);
     cur = ggml_div(ctx, cur, window_squared_sum);

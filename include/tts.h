@@ -1,7 +1,9 @@
 #pragma once
 
-#include "tts_model.h"
+#include "common.h"
 
-tts_runner * runner_from_file(str fname, int n_threads, const generation_configuration & config, bool cpu_only = true);
-int generate(tts_runner * runner, str sentence, tts_response & response, const generation_configuration & config);
-void update_conditional_prompt(tts_runner * runner, str file_path, str prompt, bool cpu_only = true);
+unique_ptr<tts_runner> runner_from_file(const char * fname, int n_threads, const generation_configuration & config,
+                                        bool cpu_only, bool use_mmap);
+void                   generate(tts_runner & runner, const char * prompt, tts_response & response,
+                                const generation_configuration & config);
+void update_conditional_prompt(tts_runner * runner, const char * file_path, const char * prompt, bool cpu_only);

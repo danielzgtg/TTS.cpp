@@ -42,15 +42,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(TTS_STANDALONE ON)
-
-    include(git-vars)
-else()
-    set(TTS_STANDALONE OFF)
-endif()
-
-option(BUILD_SHARED_LIBS "build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
+include(git-vars)
 
 if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
@@ -82,10 +74,8 @@ set(GGML_FATAL_WARNINGS     ${TTS_FATAL_WARNINGS})
 
 
 # build lib
-if (NOT TARGET ggml)
-    add_subdirectory(ggml)
-    # ... otherwise assume ggml is added by a parent CMakeLists.txt
-endif()
+add_subdirectory(ggml)
+add_subdirectory(ggml-patches)
 add_subdirectory(src)
 
 # install tts

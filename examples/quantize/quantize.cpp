@@ -6,14 +6,12 @@
 #include "tts.h"
 #include "quantize_impl.h"
 
-namespace {
-constexpr array VALID_QUANTIZATION_TYPES{
+static constexpr array VALID_QUANTIZATION_TYPES{
     GGML_TYPE_F16,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q8_0,
 };
-}
 
 int main(int argc, const char ** argv) {
     arg_list args{};
@@ -39,7 +37,7 @@ int main(int argc, const char ** argv) {
     args.parse(argc, argv);
     const quantization_params qp{
         .n_threads{static_cast<uint32_t>(static_cast<int>(args["n-threads"]))},
-        .quantize_type{static_cast<ggml_type>(static_cast<int>(args["--quantized-type"]))},
+        .quantize_type{static_cast<ggml_type>(static_cast<int>(args["quantized-type"]))},
         .quantize_output_heads{args["quantize-output-heads"]},
         .quantize_text_embeddings{args["quantize-text-embedding"]},
         .quantize_cross_attn_kv{args["quantize-cross-attn-kv"]},
@@ -47,6 +45,6 @@ int main(int argc, const char ** argv) {
         .convert_non_quantizable_to_f16{args["convert-non-quantized-to-f16"]}
     };
     TTS_ASSERT(ranges::contains(VALID_QUANTIZATION_TYPES, qp.quantize_type));
-    quantize_gguf(args["model-path"], args["--quantized-model-path"], qp);
+    quantize_gguf(args["model-path"], args["quantized-model-path"], qp);
     return 0;
 }

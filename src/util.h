@@ -55,4 +55,14 @@ std::vector<std::string> split(std::string target, const char split_on, bool inc
 std::string strip(std::string target, std::string vals = " ");
 std::string replace_any(std::string target, std::string to_replace, std::string replacement);
 
+/**
+ * Removes the last axis, for cases where it's redundantly of length 1.
+ * assert x.ndim == 3; numpy.squeeze(x, axis=-1)
+ */
+inline ggml_tensor * squeeze_3d_2d_e0(ggml_context * ctx, ggml_tensor * x) {
+    TTS_ASSERT(x->ne[0] == 1);
+    TTS_ASSERT(ggml_is_contiguous(x));
+    return ggml_reshape_2d(ctx, x, x->ne[1], x->ne[2]);
+}
+
 #endif

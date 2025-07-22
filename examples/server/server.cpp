@@ -161,7 +161,7 @@ struct worker {
         for (const auto & [id, path]: model_map.get()) {
             runners[id].reset(runner_from_file(path.c_str(), n_threads, startup_config, cpu_only));
         }
-        q.get().startup_fence.fetch_sub(1, memory_order_acq_rel);
+        q.get().startup_fence.fetch_sub(1, memory_order_relaxed);
 
         while (q.get().running.load()) {
             if (shared_ptr const task{q.get().get_next()}) {

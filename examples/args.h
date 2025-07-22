@@ -63,3 +63,6 @@ public:
         return args[full_names.at(full_name)];
     }
 };
+
+void add_baseline_args(arg_list & args);
+void add_espeak_voice_arg(arg_list & args);

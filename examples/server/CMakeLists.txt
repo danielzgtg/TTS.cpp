@@ -33,7 +33,7 @@ endforeach()
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
 
-target_link_libraries(${TARGET} PRIVATE examples_common)
+target_link_libraries(${TARGET} PRIVATE examples-common)
 
 if (LLAMA_SERVER_SSL)
     find_package(OpenSSL REQUIRED)

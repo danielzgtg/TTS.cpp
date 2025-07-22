@@ -9,12 +9,16 @@
 # endif
 #endif
 
-#include <unordered_map>
-#include <map>
-#include <unordered_set>
-#include "tokenizer.h"
 #include <algorithm>
+#include <map>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "imports.h"
+#include "tokenizer.h"
+
+struct gguf_context;
 
 static const std::string ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 static const std::string ACCENTED_A = "àãâäáåÀÃÂÄÁÅ";
@@ -416,7 +420,7 @@ struct phonemizer_rule {
 typedef std::unordered_map<std::string, phonemizer_rule*> rules_lookup;
 
 struct word_phonemizer {
-	word_phonemizer(struct single_pass_tokenizer * tokenizer): tokenizer(tokenizer) {};
+	word_phonemizer(single_pass_tokenizer * tokenizer): tokenizer(tokenizer) {};
 	~word_phonemizer() {
 		for (auto it : rules) {
 			delete it.second;
@@ -424,7 +428,7 @@ struct word_phonemizer {
 		delete tokenizer;
 	}
 
-	struct single_pass_tokenizer * tokenizer;
+	single_pass_tokenizer * tokenizer;
 	rules_lookup rules;
 
 	std::string phonemize(std::string word);
